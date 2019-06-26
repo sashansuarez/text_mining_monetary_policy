@@ -1,0 +1,712 @@
+---
+title: "Text Mining Monetary Policy"
+author: "Sasha Suarez"
+date: "April 29, 2019"
+output:
+  word_document: default
+  html_document: default
+---
+
+##**Introduction**
+
+The goal of this project is to replicate research done by Narasimhan Jegadeesh (Emory University) and Di Wu (University of Michigan) [Deciphering Fedspeak: The Information Content of FOMC Meetings (2017)](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2939937). The researchers analyze text from Federal Open Market Committee (FOMC) meeting minutes, from 1994 to 2015, by applying topic modeling, sentiment analysis, and regression modeling.
+
+Jegadeesh and Wu identify eight topics in the meeting text: policy stance, inflation, financial markets, employment, economic growth, foreign trade, consumption, and investment. The proportion of dual mandate topics (inflation and unemployment) as well as policy stance are found to be strongly correlated with stock and bond market reactions immediately after the release of FOMC minutes.
+
+Macro-economic variables (unemployment rate, recession indicator, interest rates) are found to be correlated with the proportion of certain topics discussed during meetings. Interest rates are positively correlated with growth, investment, and trade and negatively correlated with inflation, financial markets, and consumption. Unemployment rates are positively correlated with financial markets. The recession indicator also indicates that more discussion around financial markets occurs during recessionary periods.
+
+In examining topic tones, sentiment scores of policy stance are correlated with stock and bond market movement. When policy stance has a positive tone (an easing stance) stock markets go up and bond markets go down.
+
+
+##**Data Sources**
+
+An [existing corpus](https://stanford.edu/~rezab/useful/fomc_minutes.html) of FOMC meeting minutes can be found in .txt form online, provided by Stanford Adjunct Professor Reza Zadeh. This corpus contains minutes from 1994 to 2008. FOMC meeting minutes from 2008 to 2019 are web scraped from the [Board of Governors of the Federal Reserve System](https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm) website.
+
+Macro-economic variables ( [consumer price index](https://fred.stlouisfed.org/series/CPIAUCSL), [10-year Treasury yields](https://fred.stlouisfed.org/series/DGS10/), [unemployment rates](https://fred.stlouisfed.org/series/UNRATE/), and [recession indicators](https://fred.stlouisfed.org/series/USREC) ) are obtained from [FRED Economic Data](https://research.stlouisfed.org) provided by the Federal Reserve Bank of St. Louis.
+
+Historical daily price for the iShares Core S&P 500 ETF ( [SPY]((https://finance.yahoo.com/quote/SPY)) ), provided by Yahoo Finance, is used to measure stock market reaction. Historical daily 1-month London Interbank Offered Rate ( [LIBOR](https://fred.stlouisfed.org/series/USD1MTD156N) ), also provided by FRED, is used to measure bond market reaction.
+
+The following package dependencies are required:
+```{r load packages, warning=FALSE, message=FALSE}
+library(tidyverse) #Suite of data analysis packages
+library(lubridate) #More easily manipulate dates
+library(xml2) #More easily work with xml files
+library(rvest) #Download webpages
+library(tidytext) #Allows use of tidy principles for text mining
+library(topicmodels) #Interface to the C code for Latent Dirichlet Allocation (LDA) models
+library(ggplot2) #Create graphics
+```
+
+##**Analysis and Methodology**
+
+###Text Extraction
+
+FOMC meeting minutes from 1994 - 2009 are saved locally.
+
+Meeting minutes are typically organized into the following sections:  
+
+1. Meeting participants and open-market operations
+2. Staff's pre-meeting economic and financial outlook
+3. FOMC members' current economic and financial outlook
+4. Current and future outlook of monetary policy
+
+The first section is removed by creating a text split point at "the Committee ratified the Desk's domestic transactions".
+
+A function is created to collect minutes from the local file path, apply some text pre-processing, retain only the relevant sections of the minutes, and create a corpus.
+```{r corpus from file function, echo=FALSE}
+make_corpus_file = function(meeting_date){
+    
+    #Specify local path for minutes file
+    path1 = 'fomc_minutes/1994to2009/'
+    path2 = meeting_date
+    path = paste0(path1, path2)
+    
+    #Read in text file
+    x = read_file(path)
+    
+    #Remove all special characters
+    x = str_replace_all(x, '[[:punct:]]', ' ')
+    
+    #Convert to lowercase
+    x = tolower(x)
+    
+    #Test for split points
+    #Return error code and move to next iteration if not found
+    if (!str_detect(x, 'ratified')){
+                
+        cat('Error - Loop broken. Split point not found in document: ', meeting_date)
+        #Fill in row with meeting date and blank text field and continue with next iteration of loop
+        v = str_replace(meeting_date, '.txt', '')
+        z = tibble(meeting = v, text = "")
+        fomc_corpus_file = bind_rows(fomc_corpus_file, z)
+        return(fomc_corpus_file)
+        next 
+                
+    } else {
+                
+        #Split at 'ratified these transactions'
+        y = str_split_fixed(x, 'ratified', n = 2)[2]
+                
+    }
+    
+    #Seperate hyphenated words before removing punctuation. Remove single s's left over from removal of apostrophes.
+    y = str_replace_all(y, '-', ' ')
+    y = str_replace_all(y, '\\bs\\b', ' ')
+    
+    v = str_replace(meeting_date, '.txt', '')
+    
+    z = tibble(meeting = v, text = y)
+    
+    #Add to corpus
+    fomc_corpus_file = bind_rows(fomc_corpus_file, z)
+    
+    return(fomc_corpus_file)
+} #End of function
+```
+
+A loop is created to read in the list of 124 minutes and create a corpus.
+*(Note: Minutes from June 28, 2007 could not be read and is excluded from analysis.)*
+```{r loop to read minutes from file, echo=FALSE, results='hide'}
+#Collect meeting minute file names
+files_list1 = list.files('fomc_minutes/1994to2009')
+
+#Initialize empty tibble
+fomc_corpus_file = tibble()
+
+#Loop to read in minute files and create corpus
+for (i in 1:length(files_list1)){
+    fomc_corpus_file = make_corpus_file(files_list1[i])
+}
+```
+
+```{r head of file corpus, echo=FALSE}
+head(fomc_corpus_file)
+```
+
+Meeting minutes from 2010 to 2019 are scraped from the Federal Reserve website. The url for each of the minutes during this time period (https://www.federalreserve.gov/monetarypolicy/fomcminutes20190320.htm) is the same except for the meeting date. 
+
+A function is created to download minutes from the specified url, apply some text pre-processing, retain only the relevant sections of the minutes, and create a corpus.
+```{r corpus from web function, echo=FALSE}
+make_corpus_web = function(meeting_date){
+    
+    #Specify url for minutes content.
+    site_url1 = 'https://www.federalreserve.gov/monetarypolicy/fomcminutes'
+    site_url2 = meeting_date
+    site_url3 = '.htm'
+    site_url = paste0(site_url1, site_url2, site_url3)
+
+    #Scrape raw html content from site
+    x = read_html(site_url)
+
+    #Extract data using CSS selectors
+    x = html_nodes(x, 'div#leftText')
+    
+    #Test for correct CSS selector
+    if (length(x) >= 1){
+    
+        #Exit if statement and continue with loop
+        
+    }else{
+        
+        x = read_html(site_url)
+        x = html_nodes(x, 'div#article')
+        
+        if(length(x) >= 1){
+            
+            #Exit if statement and continue with loop
+            
+        }else{
+            
+            cat('Error - Loop broken. Incorrect CSS selector for document: ', meeting_date)
+            break
+            
+        }
+        
+    }
+    
+    #Convert from html to text
+    x = html_text(x)
+
+    #Remove all special characters
+    x = str_replace_all(x, '[[:punct:]]', ' ')    
+        
+    #Convert to lowercase
+    x = tolower(x)
+    
+    #Test for split points
+    #Return error code and move to next iteration if not found
+    if (!str_detect(x, 'ratified')){
+                
+        cat('Error - Loop broken. Split point not found in document: ', meeting_date)
+        #Fill in row with meeting date and blank text field and continue with next iteration of loop
+        z = tibble(meeting = meeting_date, text = "")
+        fomc_corpus_web = bind_rows(fomc_corpus_web, z)
+        return(fomc_corpus_web)
+        next 
+                
+    } else {
+                
+        #Split at 'ratified these transactions'
+        y = str_split_fixed(x, 'ratified', n = 2)[2]
+                
+    }
+    
+    #Seperate hyphenated words before removing punctuation
+    #Remove single s's from removal of apostrophes
+    y = str_replace_all(y, '-', '')
+    y = str_replace_all(y, '\\ss\\s', ' ')
+    
+    z = tibble(meeting = meeting_date, text = y)
+    
+    #Add to corpus
+    fomc_corpus_web = bind_rows(fomc_corpus_web, z)
+    
+    return(fomc_corpus_web)
+} #End of function
+```
+
+The schedule of meeting and release dates from 1994 to 2019 is obtained from the Federal Reserve website. The meeting dates from 2010 - 2019 are fed into a loop that downloads the 74 minutes from that time period and creates a corpus. This corpus is then combined with the existing corpus of minutes from 1994 - 2009.
+*(Note: Minutes from June 22, 2011 could not be downloaded and is excluded from analysis.)*
+```{r minutes schedule, echo=FALSE}
+#Get meeting and release schedule saved locally
+minutes_release = read.csv('fomc_meeting_and_release_dates.csv', header = T, stringsAsFactors = F)
+
+#Clean up blank and unnecessary columns
+minutes_release = minutes_release %>% select(-contains('X'))
+
+#Clean up blank rows
+minutes_release = minutes_release[!is.na(minutes_release$days_to_release),]
+
+#Parse dates
+minutes_release$meeting_date = as.Date.character(minutes_release$meeting_date, tryFormats = "%d-%b-%y")
+
+minutes_release$release_date = as.Date.character(minutes_release$release_date, tryFormats = "%d-%b-%y")
+
+#Clean up meeting dates that are outside of normal release date cycle (e.g. additional meetings and conferene calls that occurred during the 2008 Financial Crisis)
+minutes_release = minutes_release[!minutes_release$days_to_release == 0,]
+
+minutes_release = minutes_release[!minutes_release$meeting_date == "2007-08-10",]
+
+minutes_release = minutes_release[!minutes_release$meeting_date == "2007-08-16",]
+
+#Collapse to get meeting dates for use in url path
+minutes_release = minutes_release %>% mutate(url_part=str_replace_all(meeting_date, '-',''))
+
+head(minutes_release)
+```
+
+```{r loop to read minutes from web, echo=FALSE, results='hide'}
+#2009 and earlier are already in .txt files
+#2010 to present need to be scraped from web
+url_list = minutes_release %>% filter(year(meeting_date) >= 2010)
+
+#Initialize empty tibble
+fomc_corpus_web = tibble()
+
+#Loop to read in minute files and create corpus
+for (i in 1:length(url_list[,4])){
+    fomc_corpus_web = make_corpus_web(url_list[i,4])
+}
+```
+
+###Pre-Processing
+
+The complete corpus of minutes is then tokenized (a table is created with one word, per document, per row). This format makes it easier to remove stop words and stem words to their roots.
+```{r tokenization, echo=FALSE}
+#Combine minutes to create complete corpus 1994 - 2019
+fomc_corpus = bind_rows(fomc_corpus_file, fomc_corpus_web)
+
+#Tokenize
+fomc_tidy = unnest_tokens(fomc_corpus, word, text)
+```
+
+```{r head of tidy, echo=FALSE}
+head(fomc_tidy)
+```
+
+Stop words are removed. The list of stop words used comes from the tidytext data frame composed of three English lexicons. Some non-useful words, such as names of months, are manually added to the list of stop words. (These words were discovered and retro-actively added after applying the LDA topic model.)
+```{r remove stop words, echo=FALSE}
+#Add non-useful words to list of stop words
+#(Added after running LDA and analyzing words with highest beta values)
+new_stop_words = stop_words
+
+new = c("month", "year", "quarter", "period", "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december", "participant")
+
+new = tibble(word=new)
+
+#Label newly added words to differentiate from other lexicons
+new[,'lexicon'] = 'fomc-ss'
+
+new_stop_words = bind_rows(new_stop_words, new)
+
+#Remove stop words before stemming
+#Stemming is process-intensive, removing stop words cuts the data set by 50%
+fomc_stemmed = fomc_tidy
+
+fomc_stemmed = anti_join(fomc_stemmed, new_stop_words, by = "word")
+```
+
+The lemmatization list used for stemming is provided by GitHub user [michmech](https://github.com/michmech/lemmatization-lists/blob/master/lemmatization-en.txt).  Stemming allows words that are inflected or derived from the same root to be recognized as the same word by an algorithm.  
+
+A loop is created to replace terms with their stems.
+```{r stemming, echo=FALSE}
+#Table of terms for stemming
+stems = read.delim('lemmatization-en.txt', stringsAsFactors = F)
+colnames(stems) = c('stem', 'term')
+
+#Stemming
+for (i in 1:nrow(fomc_stemmed)){
+    if(fomc_stemmed[i,2] %in% stems$term){
+        x = as.character(fomc_stemmed[i,2])
+        y = stems[stems$term==x,][1,]$stem
+        fomc_stemmed[fomc_stemmed$word==x,]$word = y
+    }
+}
+
+#Keep stemmed words in a seperate object
+#Stemming takes about 7 minutes to run
+fomc_tidy = fomc_stemmed
+
+#Remove numbers created from stemming
+fomc_tidy = fomc_tidy[!str_detect(fomc_tidy$word, '[[:digit:]]'),]
+
+#Apply stop word removal a second time for words that may have been introduced after stemming
+fomc_tidy = anti_join(fomc_tidy, new_stop_words, by = "word")
+```
+
+Now that common stop words have been removed, very common words that are unique to this corpus should also be removed. This can be done by calculating the TF-IDF value for each word.
+
+The term frequency (TF) of a word is calculated as the number of times that word appears in a document divided by the total number of words in that document. The inverse document frequency (IDF) of a word is calculated as the natural log of the total number of documents in the corpus divided by the number of documents that contain that word. The product of these two terms (TF-IDF) provides a measure of the importance of a word in a corpus. TF-IDF approaches 0 the more common a word is.
+
+Words with TF-IDF values of 0 are removed before applying the topic model.
+```{r tf-idf, echo=FALSE}
+#Find word frequencies
+fomc_tidy = fomc_tidy %>% group_by(meeting, word) %>% count() %>% ungroup()
+
+#Create tf-idf table
+fomc_tf_idf = bind_tf_idf(fomc_tidy, term = word, document = meeting, n = n)
+
+#Remove terms where tf-idf = 0 (very common words)
+fomc_tf_idf = fomc_tf_idf[!fomc_tf_idf$tf_idf == 0,]
+
+fomc_tidy = fomc_tf_idf %>% select(meeting, word, n)
+```
+
+```{r head of tf-idf, echo=FALSE}
+head(fomc_tf_idf)
+```
+
+###Topic Modeling
+
+The data table is converted to a document-term-matrix for input into the topic model. A dtm is a large and usually sparse matrix that contains all of the corpus documents as column vectors and corpus words as row vectors. The value of each element is the term frequency.
+```{r document term matrix, echo=FALSE}
+#Convert to document-term matrix.
+fomc_dtm = cast_dtm(data = fomc_tidy, document = meeting, term = word, value = n)
+```
+
+```{r fomc_dtm, echo=FALSE}
+fomc_dtm
+```
+
+
+The Latent Dirichlet Algorithm is applied to the matrix. The number of topics must be specified as a parameter for the model. The model is applied to the data using eight, seven, and six topics.
+```{r topic modeling}
+#Estimate LDA model
+#(Takes about 1-2 minutes to run)
+
+#8 topics based on 'Deciphering Fedspeak' paper.
+fomc_lda8 = LDA(fomc_dtm, k = 8, method = "Gibbs", control = list(seed = 1, burnin = 1000, thin = 100, iter = 1000))
+
+#Explore fewer topics for better distinction of topics
+#7 topics
+fomc_lda7 = LDA(fomc_dtm, k = 7, method = "Gibbs", control = list(seed = 1, burnin = 1000, thin = 100, iter = 1000))
+
+#6 topics
+fomc_lda6 = LDA(fomc_dtm, k = 6, method = "Gibbs", control = list(seed = 1, burnin = 1000, thin = 100, iter = 1000))
+```
+
+The effectiveness of the specified topic parameter is assessed by ensuring that each word is allocated to as few topics as possible. The *beta* value measures the probability that a term will be generated from a specific topic. 
+
+In examining the top 20 terms per topic generated from each of the three iterations of the model, eight topics appears to be too many. Many duplicate words are shown across topics. Six topics appears to have better distinction between topics.
+```{r compare betas, echo=FALSE}
+#Beta
+topics_beta8 = tidy(fomc_lda8, matrix = "beta")
+
+topics_beta7 = tidy(fomc_lda7, matrix = "beta")
+
+topics_beta6 = tidy(fomc_lda6, matrix = "beta")
+
+#Find top terms with highest probability of generating each topic
+top_terms8 = topics_beta8 %>% group_by(topic) %>% top_n(20, beta) %>% ungroup() %>% arrange(topic, -beta)
+
+top_terms7 = topics_beta7 %>% group_by(topic) %>% top_n(20, beta) %>% ungroup() %>% arrange(topic, -beta)
+
+top_terms6 = topics_beta6 %>% group_by(topic) %>% top_n(20, beta) %>% ungroup() %>% arrange(topic, -beta)
+
+#View top 20 terms for each LDA model
+
+#Too many common terms with eight topics
+top_terms8 %>% mutate(term = reorder(term, beta)) %>% ggplot(aes(x = term, y = beta, fill = factor(topic))) + geom_col(show.legend = F) + facet_wrap(~ topic, scales = 'free') + coord_flip()
+
+#Not much better than 8 topics
+top_terms7 %>% mutate(term = reorder(term, beta)) %>% ggplot(aes(x = term, y = beta, fill = factor(topic))) + geom_col(show.legend = F) + facet_wrap(~ topic, scales = 'free') + coord_flip()
+
+#Better - can more easily differentiate topics
+top_terms6 %>% mutate(term = reorder(term, beta)) %>% ggplot(aes(x = term, y = beta, fill = factor(topic))) + geom_col(show.legend = F) + facet_wrap(~ topic, scales = 'free') + coord_flip()
+```
+
+The first four topics are assigned with some degree of confidence:  
+
+1. Financial markets
+2. Inflation
+3. Investment
+4. Consumption
+
+However, topics 5 and 6 appear to be similar (policy stance). It is useful to look at the terms between topics with largest beta spread. This indicates the terms that are more likely to appear in one topic than the other.
+
+In comparing topics 5 and 6, topic 5 appears to be policy stance. Topic 6, however, appears to be a mixture of policy stance and growth.
+```{r beta spread 5 and 6, echo=FALSE}
+#Topics 5 and 6 spread
+beta_spread_5_6 = topics_beta6 %>% filter(topic == 5 | topic == 6) %>% mutate(topic = paste0("topic", topic)) %>% spread(topic, beta) %>% filter(topic5 > .001 | topic6 > .001) %>% mutate(log_ratio = log2(topic6 / topic5))
+
+#Topic 6
+beta_spread_5_6 %>% arrange(desc(log_ratio)) %>% group_by(term, topic5, topic6) %>% top_n(10, log_ratio)
+
+#Topic 5 - looks more like policy stance
+beta_spread_5_6 %>% arrange(log_ratio) %>% group_by(term, topic5, topic6) %>% top_n(10, log_ratio)
+```
+
+The remaining topics are assigned as follows:  
+
+5. Policy stance
+6. Growth/Policy stance
+
+Topics on unemployment and foreign trade could not be identified.
+
+The *gamma* value is the estimated proportion of words in the document that are generated from a specific topic.
+```{r assign topics, echo=FALSE}
+topics_gamma6 = tidy(fomc_lda6, matrix = "gamma")
+
+#Assign topics
+topics_gamma6$topic = factor(topics_gamma6$topic, levels = 1:6, labels = c("Market","Inflation","Investment","Consumption","Policy","Growth_Policy"))
+```
+
+A substantial variation of topic proportions in FOMC meetings can be seen over time. During the 1990's the FOMC devoted about 60% of the discussion to economic growth. This has declined precipitously since then. During the 2008 Financial Crisis, much of the discussion was centered around financial markets. Since then, policy stance and inflation have been a large part of the discussion. This is indicative of the fear that quantitative easing may lead to inflation and the extent to which the Federal Reserve has remained under the 2% inflation target range.
+```{r explore gamma, echo=FALSE}
+#Topic proportions over time
+topics_gamma6$document = as.Date.character(topics_gamma6$document, tryFormats = "%Y%m%d")
+
+topics_gamma6 %>% ggplot() + geom_line(aes(x = document, y = gamma, color = factor(topic))) + xlab("Meetings") + ylab("Proportion of Document") + theme(legend.title = element_blank())
+```
+
+###Sentiment Analysis
+
+Sentiment Analysis is applied to the tokenized data table using the sentiment library from the tidytext package. The AFINN lexicon is chosen for its numerical scoring method (-5 for negative tone to +5 for positive tone).
+
+Aggregate tone scoring is calculated for each topic in each document by multiplying word frequency, tone score, and beta.
+
+Dips during the recessions following the Dot-com Bubble and the 2008 Financial Crisis are expected. However, there is alot of noise in the aggregate tone scores. A spike can be seen in policy tone (which is indicative of policy easing) following the financial crisis which may correspond to quantitative easing.
+```{r sentiment analysis, echo=FALSE}
+#Use AFINN for variation in tone scores
+tone = sentiments %>% filter(lexicon == 'AFINN')
+
+key_words = left_join(fomc_tidy, topics_beta6, by = c("word" = "term"))
+
+document_tones = inner_join(key_words, tone, by = c("word" = "word"))
+
+#Aggregate tone scoring
+document_tones = document_tones %>% mutate(wt_score = n*beta*score)
+
+document_tones = document_tones %>% group_by(meeting, topic) %>% summarise(agg_score = sum(wt_score)/sum(n))
+
+document_tones$meeting = as.Date.character(document_tones$meeting, tryFormats = '%Y%m%d')
+
+#Assign topics
+document_tones$topic = factor(document_tones$topic, levels = 1:6, labels = c("Market","Inflation","Investment","Consumption","Policy","Growth_Policy"))
+
+document_tones %>% ggplot() + geom_line(aes(x = meeting, y = agg_score, color = topic))
+```
+
+###Macro-Variables
+
+Stock market and bond market data will be used measure market reaction. Unemployment rate, recession indicator, and interest rates will be used to explore the relationship of macro-economic variables to FOMC meeting topics and tone.
+
+Ideally, the trading price window to observe should be about 2 hours following the time the minutes are released. It is difficult to find the exact time when the minutes are released, especially prior to 2004 - 2005 when the FOMC started releasing minutes at around 2pm. Additionally, there is usually a cost associated with acquiring intra-day trading data.
+
+For this analysis, the difference between open and closing price on the day the minutes were released will be used to measure stock market reaction. It is expected that this wider observation window will introduce some noise into the regression analysis.
+
+Get historical daily stock market prices to measure stock market reaction.
+```{r stock market data, echo=FALSE}
+#Get stock market daily return data
+stock_market = read.csv('macro_variables/SPY.csv', header = T, stringsAsFactors = F)
+
+#Parse dates
+stock_market$Date = as.Date.character(stock_market$Date, tryFormats = "%Y-%m-%d")
+
+#Pull in corresponding stock movement for minutes release
+stock_market_reaction = left_join(minutes_release, stock_market, by = c("release_date"="Date"))
+
+#Calculate daily percentage change
+stock_market_reaction = stock_market_reaction %>% mutate(open_to_close = round((Close - Open)/Open, 3))
+
+head(select(stock_market_reaction, meeting_date, release_date, open_to_close))
+```
+
+Get historical LIBOR to measure bond market reaction.
+```{r bond market data, echo=FALSE, warning=FALSE}
+#Get daily LIBOR data
+bond_market = read.csv('macro_variables/libor_1mo.csv', header = T, stringsAsFactors = F)
+
+#Parse dates
+bond_market$DATE = as.Date.character(bond_market$DATE, tryFormats = "%Y-%m-%d")
+
+#Change LIBOR rate from string to numeric
+bond_market$USD1MTD156N = as.double(bond_market$USD1MTD156N)
+
+#Calculate contract price
+bond_market = bond_market %>% mutate(contract_price = 100 - USD1MTD156N)
+
+#Calculate change in price from previous day
+bond_market = bond_market %>% mutate(LIBOR_price_change = round((contract_price-lag(contract_price, 1))/lag(contract_price, 1), 4))
+
+#Pull in corresponding LIBOR movement for minutes release
+bond_market_reaction = left_join(minutes_release, bond_market, by = c("release_date"="DATE"))
+
+head(select(bond_market_reaction, meeting_date, release_date, LIBOR_price_change))
+```
+
+Get unemployment rates.
+```{r unemployment data, echo=FALSE}
+#Pull in unemployment data
+unemployment = read.csv('macro_variables/unemployment.csv', header = T, stringsAsFactors = F)
+
+unemployment = unemployment %>% mutate(year = as.integer(substr(DATE, 1, 4)))
+
+unemployment = unemployment %>% mutate(month = as.integer(substr(DATE, 6, 7)))
+
+unemployment = select(unemployment, -DATE)
+
+head(select(unemployment, -month))
+```
+
+Get recession data. Between 1994 and 2019, there were two recessions.
+```{r recession data, echo=FALSE}
+#Pull in recession data
+recession_indicator = read.csv('macro_variables/recession_indicator.csv', header = T, stringsAsFactors = F)
+
+#Isolate year to join on other macro-variable data
+recession_indicator = recession_indicator %>% mutate(year = as.integer(substr(observation_date, 1, 4)))
+
+recession_indicator = recession_indicator %>% filter(year >= 1994)
+
+#Isolate month to join on other macro-variable data
+recession_indicator = recession_indicator %>% mutate(month = as.integer(substr(observation_date, 6, 7)))
+
+recession_indicator = select(recession_indicator, -observation_date)
+
+colnames(recession_indicator) = c("REC", "year", "month")
+
+head(select(recession_indicator, REC, year))
+```
+
+Get 10-year Treasury yields.
+```{r interest rates, echo=FALSE, warning=FALSE}
+interest_rates = read.csv('macro_variables/DGS10.csv', header = T, stringsAsFactors = F)
+
+interest_rates$DATE = as.Date.character(interest_rates$DATE, tryFormats = "%Y-%m-%d")
+
+interest_rates$DGS10 = as.double(interest_rates$DGS10)
+
+colnames(interest_rates) = c("DATE", "10yr_yield")
+
+head(interest_rates)
+```
+
+###Regression Analysis
+
+```{r analysis table, echo=FALSE}
+#Create table with all variables as input for regression analysis.
+
+#Topic tones
+analysis_table = document_tones %>% mutate(topic = paste0(topic,'_tone'))
+
+analysis_table = analysis_table %>% spread(topic, agg_score)
+
+#Topic proportions
+gamma = topics_gamma6 %>% mutate(topic = paste0(topic,'_proportion'))
+
+gamma = gamma %>% spread(topic, gamma)
+
+analysis_table = left_join(analysis_table, gamma, by = c("meeting" = "document"))
+
+#Stock market reaction
+analysis_table = left_join(analysis_table, select(stock_market_reaction, meeting_date, open_to_close), by = c("meeting" = "meeting_date"))
+
+#Bond market reaction
+analysis_table = left_join(analysis_table, select(bond_market_reaction, meeting_date, LIBOR_price_change), by = c("meeting" = "meeting_date"))
+
+#Isolate year to join recession indicator
+analysis_table = analysis_table %>% mutate(year = as.integer(substr(meeting, 1, 4)))
+
+#Isolate month to join recession indicator
+analysis_table = analysis_table %>% mutate(month = as.integer(substr(meeting, 6, 7)))
+
+#Recession indicator
+analysis_table = left_join(analysis_table, recession_indicator, by = c("year" = "year", "month" = "month"))
+
+#Manually enter gaps in recession periods.
+#Dot-com bubble recession lasted from March to November 2001
+analysis_table[56,'REC'] = 1
+analysis_table[57,'REC'] = 1
+analysis_table[59,'REC'] = 1
+
+#Financial Crisis recession lasted from December 2007 to June 2009
+for (i in 107:119) {
+    analysis_table[i,'REC'] = 1
+}
+
+#Fill in 0s everywhere else
+analysis_table = analysis_table %>% mutate(REC = if_else(is.na(REC), 0, REC))
+
+analysis_table$REC = factor(analysis_table$REC, levels = 0:1)
+
+#Bring in unemployment rate
+analysis_table = left_join(analysis_table, unemployment, by = c("year" = "year", "month" = "month"))
+
+#Bring in interest rates
+analysis_table = left_join(analysis_table, interest_rates, by = c("meeting" = "DATE"))
+```
+
+**Does the macro-economic environment have an effect on what topics are discussed during FOMC meetings?**  
+
+Regress topic proportions on macro-economic variables: 
+```{r regression set 1, echo=FALSE, warning=FALSE}
+prop_macro_fit1 = lm(Consumption_proportion ~ REC + `10yr_yield` + UNRATE, data = analysis_table)
+
+prop_macro_fit2 = lm(Growth_Policy_proportion ~ REC + `10yr_yield` + UNRATE, data = analysis_table)
+
+prop_macro_fit3 = lm(Inflation_proportion ~ REC + `10yr_yield` + UNRATE, data = analysis_table)
+
+prop_macro_fit4 = lm(Investment_proportion ~ REC + `10yr_yield` + UNRATE, data = analysis_table)
+
+prop_macro_fit5 = lm(Market_proportion ~ REC + `10yr_yield` + UNRATE, data = analysis_table)
+
+prop_macro_fit6 = lm(Policy_proportion ~ REC + `10yr_yield` + UNRATE, data = analysis_table)
+```
+
+```{r policy prop on macro, echo=FALSE}
+summary(prop_macro_fit5)
+```
+
+The results suggest that during a recession, FOMC members will devote more of the discussion to financial markets and less on economic growth, inflation, and policy stance.
+
+During periods where 10-year Treasury yields are high, FOMC members will focus more on economic growth and investment and less on inflation or policy stance.
+
+During periods where unemployment rates are high, discussion will revolve more around financial markets and policy stance and less on inflation.
+
+**Does the macro-economic environment have an effect on topic tones during FOMC meetings?**  
+
+Regress tone scores on macro-economic variables:
+```{r regression set 2, echo=FALSE, warning=FALSE}
+tone_macro_fit1 = lm(Consumption_tone ~ REC + `10yr_yield` + UNRATE, data = analysis_table)
+
+tone_macro_fit2 = lm(Growth_Policy_tone ~ REC + `10yr_yield` + UNRATE, data = analysis_table)
+
+tone_macro_fit3 = lm(Inflation_tone ~ REC + `10yr_yield` + UNRATE, data = analysis_table)
+
+tone_macro_fit4 = lm(Investment_tone ~ REC + `10yr_yield` + UNRATE, data = analysis_table)
+
+tone_macro_fit5 = lm(Market_tone ~ REC + `10yr_yield` + UNRATE, data = analysis_table)
+
+tone_macro_fit6 = lm(Policy_tone ~ REC + `10yr_yield` + UNRATE, data = analysis_table)
+```
+
+```{r policy tone on macro, echo=FALSE}
+summary(tone_macro_fit2)
+```
+
+The effect of macro-variables on topic tones are more difficult to discern. Generally, it appears that as economic and financial conditions begin to deteriorate (unemployment increases, interest rates increase, higher likelihood of recession) the tone across most topics become negative. 
+
+**Does the proportion of topics discussed at FOMC meetings have an effect on the stock and bond markets?**  
+
+Regress stock market movement and LIBOR change on topic proportions:
+```{r regression 3, echo=FALSE}
+stock_prop_fit = lm(open_to_close ~ Consumption_proportion + Growth_Policy_proportion + Inflation_proportion + Investment_proportion + Market_proportion + Policy_proportion, data = analysis_table)
+
+summary(stock_prop_fit)
+```
+
+```{r regression 4, echo=FALSE}
+bond_prop_fit = lm(LIBOR_price_change ~ Consumption_proportion + Growth_Policy_proportion + Inflation_proportion + Investment_proportion + Market_proportion + Policy_proportion, data = analysis_table)
+```
+
+Financial markets appears to be the only topic that has a significant, though only slight, effect on stock market movement. When markets are discussed during the FOMC meetings, stock market prices appear to go down.
+
+None of the topics' proportions significantly affect the bond market.
+
+**Does the tone of topics discussed at FOMC meetings have an effect on the stock and bond markets?**  
+
+Regress stock market movement and LIBOR change on tone scores:
+```{r regression 5}
+stock_tone_fit = lm(open_to_close ~ Consumption_tone + Growth_Policy_tone + Inflation_tone + Investment_tone + Market_tone + Policy_tone, data = analysis_table)
+```
+
+```{r regression 6}
+bond_tone_fit = lm(LIBOR_price_change ~ Consumption_tone + Growth_Policy_tone + Inflation_tone + Investment_tone + Market_tone + Policy_tone, data = analysis_table)
+
+summary(bond_tone_fit)
+```
+
+When the tone around financial markets is positive, the bond market appears to experience price declines (which means that yields go up).
+
+##**Findings and Areas of Improvement**
+
+Six out of eight topics were identified during the text extraction and topic modeling (topics around unemployment and foreign trade were not found.) This could potentially be improved by breaking the corpus down to the paragraph level or performing simulations to identify the most effective parameters for the LDA model. Additionally, the TF-IDF method for removing common words from the corpus may have hindered the identification of unemployment and foreign trade topics by removing critical words.
+
+Similar to Jegadeesh and Wu, macro-economic variables have a significant effect on topic tones and the variation of topic proportions discussed during FOMC meetings. As economic conditions deteriorate, financial markets, investment, and policy stance are discussed to a larger degree. Also, most topics have a negative tone.
+
+Stock and bond market reactions appear to be mostly unaffected by the tone and proportion of FOMC discussion devoted to any particular topic. This is likely due to the observation window being set to the entire trading day. Obtaining the exact time when meeting minutes were released as well as intra-day historical trading data could improve the analysis of market reaction. Furthermore, the method used to calculate aggregate tones scores produced alot of noise during the analysis and should be explored further.
+
+##**Additional Resources**
+
+Julia Silga and David Robinson. (2017) *Text Mining with R: A Tidy Approach*. 1st Edition. O'reilly Media. 
